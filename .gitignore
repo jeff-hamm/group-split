@@ -2,3 +2,5 @@
 *#
 *.pyc
 *bank*
+*.pkl
+**/consumer_oauth.json

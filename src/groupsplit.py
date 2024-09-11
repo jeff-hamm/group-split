@@ -1,4 +1,7 @@
 import os
+from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
+import click
 import re
 import csv
 import sys
@@ -11,6 +14,7 @@ import logging
 import optparse
 import requests
 import subprocess
+import os
 import webbrowser
 import oauthlib.oauth1
 from money import Money
@@ -64,39 +68,53 @@ class Splitwise:
     """
     Client for communicating with Splitwise api
     """
-    def __init__(self, api_client='oauth_client.pkl'):
+    def __init__(self, api_client='oauth_client.pkl', ckey=None,csecret=None):
         if os.path.isfile(api_client):
             with open(api_client, 'rb') as oauth_pkl:
                 self.client = pickle.load(oauth_pkl)
         else:
-            self.get_client()
+            self.get_client(ckey,csecret)
 
-    def get_client_auth(self):
+    def get_client_auth(self,ckey,csecret):
+        ckey = os.environ.get('ckey') or ckey
+        csecret = os.environ.get('csecret') or csecret
         if os.path.isfile("consumer_oauth.json"):
             with open("consumer_oauth.json", 'rb') as oauth_file:
                 consumer = json.load(oauth_file)
-                ckey = consumer['consumer_key']
-                csecret = consumer['consumer_secret']
+                self.ckey = ckey or consumer['consumer_key']
+                self.csecret = csecret or consumer['consumer_secret']
         else:
-            with open("consumer_oauth.json", 'wb') as oauth_file:
-                json.dump({'consumer_key':'YOUR KEY HERE',
-                           'consumer_secret':'YOUR SECRET HERE'}, oauth_file)
+            self.ckey = ckey or click.prompt("Your splitwise oauth key (from https://secure.splitwise.com/oauth_clients)")
+            self.csecret = csecret or click.prompt("Your splitwise oauth secret")
+            json_file={'consumer_key':self.ckey or 'YOUR KEY HERE',
+                           'consumer_secret':self.csecret or 'YOUR SECRET HERE'}
+            print(json_file)
+            with open("consumer_oauth.json", "w", encoding="utf8") as oauth_file:
+                json.dump(json_file, oauth_file)
+        if(not self.ckey or not self.csecret):
             exit("go to https://secure.splitwise.com/oauth_clients to obtain your keys."+
-                 "place them in consumer_oauth.json")
-        self.ckey = ckey
-        self.csecret = csecret
+                 "place them in consumer_oauth.json or in ckey/csecret")
+            
 
-    def get_client(self):
-        self.get_client_auth()
+    def get_client(self,ckey,csecret):
+        self.get_client_auth(ckey,csecret)
         client = oauthlib.oauth1.Client(self.ckey, client_secret=self.csecret)
         uri, headers, body = client.sign("https://secure.splitwise.com/api/v3.0/get_request_token",
                                          http_method='POST')
         r = requests.post(uri, headers=headers, data=body)
         resp = r.text.split('&')
+        if(len(resp) < 2):
+            logger.error(r.text)
+            logger.error("go to https://secure.splitwise.com/oauth_clients to obtain your keys.")
+            self.client = None
+            return;
+        else:
+            logger.debug(r.text)
+
         oauth_token = resp[0].split('=')[1]
         oauth_secret = resp[1].split('=')[1]
         uri = "https://secure.splitwise.com/authorize?oauth_token=%s" % oauth_token
-
+#        logger.debug(uri, oauth_secret)
         webbrowser.open_new(uri)
 
         # proc = subprocess.Popen(['python', 'server.py'], stdout=subprocess.PIPE)
@@ -104,7 +122,10 @@ class Splitwise:
         # if stderr:
         #     exit(stderr)
 
-        verifier_input = input('Copy the oauth verifier from the success page in the browser window : ')
+        verifier_input = click.prompt(f'Navigate to \n{uri}\n then copy the url from the success page in the browser window:\n')
+ #       logger.debug(verifier_input)
+        parsed_url = urlparse(verifier_input)
+        verifier_input=parse_qs(parsed_url.query)['oauth_verifier'][0]
 
         client = oauthlib.oauth1.Client(self.ckey, client_secret=self.csecret,
                                         resource_owner_key=oauth_token,
@@ -115,6 +136,7 @@ class Splitwise:
         uri, headers, body = client.sign("https://secure.splitwise.com/api/v3.0/get_access_token",
                                          http_method='POST')
         resp = requests.post(uri, headers=headers, data=body)
+#        print(resp.text)
         tokens = resp.text.split('&')
         oauth_token = tokens[0].split('=')[1]
         oauth_secret = tokens[1].split('=')[1]
@@ -210,6 +232,9 @@ class SplitGenerator():
         if os.path.isfile(options.csv_settings):
             with open(options.csv_settings, 'rb') as f:
                 self.csv = pickle.load(f)
+        elif os.path.isfile("/csv_settings.pkl"):
+            with open("/csv_settings.pkl", 'rb') as f:
+                self.csv = pickle.load(f)
         else:
             self.csv = CsvSettings(self.rows)
 
@@ -229,7 +254,7 @@ class SplitGenerator():
         **change csvDateFormat to the format in your csv if necessary** 
         Further reading on date formats: https://docs.python.org/2/library/datetime.html#strftime-and-strptime-behavior
         """
-        csvDateFormat="%m/%d/%Y"
+        csvDateFormat="%Y-%m-%d"
         self.transactions = []
         for r in self.rows:
             # if not self.options.try_all and do_hash(str(r)) == self.csv.newest_transaction:
@@ -319,9 +344,11 @@ class SplitGenerator():
         paramsStr = urllib.parse.urlencode(params)
         return "https://secure.splitwise.com/api/v3.0/create_expense?%s" % (paramsStr)
 
+import os
 
 def main():
-    usage = "groupsplit.py [options] <path to csv file> <splitwise group name>"
+
+    usage = "groupsplit.py [options] [splitwise group name]"
     parser = optparse.OptionParser(usage=usage)
     parser.add_option('-v', '--verbosity', default=2, dest='verbosity', help='change the logging level (0 - 6) default: 2')
     parser.add_option('-y','',default=False, action='store_true', dest='yes', help='split all transactions in csv without confirmation')
@@ -330,17 +357,33 @@ def main():
     parser.add_option('', '--api-client', default='oauth_client.pkl', dest='api_client', help='supply different splitwise api client (for testing mostly)')
     parser.add_option('-a', '--all', default=False, action='store_true', dest='try_all', help='consider all transactions in csv file no matter whether they were already seen')
     options, args = parser.parse_args()
-    logger.setLevel(log_levels[options.verbosity])
+    logger.setLevel(log_levels[int(options.verbosity)])
+    directory="/imports"
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    os.chdir(directory)
+    files=os.listdir(directory)
+    if(not len(files)):
+        print("No csv files found")
+        return
     splitwise = Splitwise(options.api_client)
-    split_gen = SplitGenerator(options, args, splitwise)
-    print("Uploading splits")
-    for uri in split_gen:
-        if options.dryrun:
-            print(uri)
-            continue
-        splitwise.post_expense(uri)
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    if(not splitwise.client):
+        return
+    suffix=".csv"
+    print(options)
+    group = (args and len(args) and args[0]) or click.prompt("Splitwise group name?")
+    for filename in files:
+        if(filename.endswith(suffix)):
+            if click.confirm(f"Do you want to import {filename}?", default=True):
+                split_gen = SplitGenerator(options, [filename,group], splitwise)
+                #print("Uploading splits")
+                for uri in split_gen:
+                    if options.dryrun:
+                        #print(uri)
+                        continue
+                    splitwise.post_expense(uri)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
 
 if __name__ == "__main__":
